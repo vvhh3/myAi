@@ -1,155 +1,343 @@
-import csv  # Подключаем csv, чтобы сохранять оценки пользователя в файл.
-import os  # Подключаем os, чтобы удобно строить пути к файлам.
-import random  # Подключаем random, чтобы выбирать разные шутки.
-import re  # Подключаем re, чтобы разбивать текст на слова.
-from collections import defaultdict  # Подключаем defaultdict, чтобы удобно хранить веса слов.
+import csv
+import math
+import os
+import random
+import re
+from collections import defaultdict
 
-from datasets import load_dataset  # Подключаем load_dataset, чтобы загрузить датасет с Hugging Face.
+import torch
+import torch.nn as nn
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
 
+# ─── Константы ────────────────────────────────────────────────────────────────
 
-DATASET_NAME = "IgorVolochay/russian_jokes"  # Название датасета с русскими шутками на Hugging Face.
-RATINGS_FILE = os.path.join("ratings.csv")  # Файл, куда программа будет сохранять оценки пользователя.
-MAX_JOKES = 5000  # Ограничиваем количество шуток, чтобы программа работала быстро даже на слабом компьютере.
-MIN_JOKE_LENGTH = 20  # Слишком короткие тексты пропускаем, потому что они часто бесполезны.
-MAX_JOKE_LENGTH = 500  # Слишком длинные истории пропускаем, чтобы программа показывала именно короткие шутки.
-GOOD_RATING = 4  # Оценки 4 и 5 считаем хорошими.
-BAD_RATING = 2  # Оценки 1 и 2 считаем плохими.
+DATASET_NAME   = "IgorVolochay/russian_jokes"
+RATINGS_FILE   = "ratings.csv"
+MODEL_FILE     = "joke_model.pt"
+TOKENIZER_FILE = "joke_tokenizer.pt"
+MAX_JOKES      = 5000
+MIN_JOKE_LENGTH = 20
+MAX_JOKE_LENGTH = 500
+GOOD_RATING    = 4
+BAD_RATING     = 2
+
+# Гиперпараметры модели — меняй если нужно
+DIM      = 256   # размер векторов (больше = умнее, но медленнее)
+DEPTH    = 6     # количество слоёв трансформера
+HEADS    = 4     # количество голов внимания
+MAX_LEN  = 200   # максимальная длина в токенах
+EPOCHS   = 40    # количество эпох обучения
+BATCH    = 32    # размер батча
 
 os.makedirs("Ai", exist_ok=True)
 if not os.path.exists(RATINGS_FILE):
     with open(RATINGS_FILE, "w", encoding="utf-8") as f:
         f.write("topic,joke,rating\n")
 
+# ─── Загрузка датасета ────────────────────────────────────────────────────────
 
-def split_words(text):  # Создаем функцию, которая превращает текст в список слов.
-    text = text.lower()  # Переводим текст в нижний регистр, чтобы "Кот" и "кот" считались одним словом.
-    return re.findall(r"[а-яёa-z0-9]+", text)  # Возвращаем только слова и цифры без знаков препинания.
-
-
-def find_text_column(dataset_part):  # Создаем функцию, которая ищет колонку с текстом шутки.
-    possible_names = ["jokes", "joke", "text", "content", "anekdot", "answer"]  # Перечисляем самые вероятные названия колонок.
-    for name in possible_names:  # Перебираем возможные названия по очереди.
-        if name in dataset_part.column_names:  # Проверяем, есть ли такая колонка в датасете.
-            return name  # Возвращаем найденное название колонки.
-    for name in dataset_part.column_names:  # Если стандартные названия не подошли, перебираем все колонки.
-        first_value = dataset_part[0][name]  # Берем первое значение из колонки.
-        if isinstance(first_value, str):  # Проверяем, что значение является строкой.
-            return name  # Возвращаем первую текстовую колонку.
-    raise ValueError("В датасете не найдена текстовая колонка со шутками.")  # Сообщаем об ошибке, если текста нет.
+def split_words(text):
+    text = text.lower()
+    return re.findall(r"[а-яёa-z0-9]+", text)
 
 
-def load_jokes():  # Создаем функцию загрузки шуток из датасета.
-    print("Загружаю датасет с русскими шутками...")  # Показываем пользователю, что сейчас идет загрузка.
-    try:  # Пробуем обычную загрузку датасета.
-        dataset = load_dataset(DATASET_NAME)  # Загружаем датасет с Hugging Face по имени.
-        split_name = "train" if "train" in dataset else list(dataset.keys())[0]  # Берем train, а если его нет, берем первый раздел.
-        dataset_part = dataset[split_name]  # Достаем нужный раздел датасета.
-    except Exception:  # Если обычная загрузка упала из-за схемы датасета, используем CSV-файл.
-        csv_path = f"hf://datasets/{DATASET_NAME}/dataset.csv"  # Создаем путь к CSV-файлу внутри репозитория Hugging Face.
-        dataset_part = load_dataset("csv", data_files=csv_path, split="train")  # Загружаем тот же датасет напрямую из CSV.
-    text_column = find_text_column(dataset_part)  # Находим колонку, где лежит текст шутки.
-    jokes = []  # Создаем пустой список для очищенных шуток.
-
-    for row in dataset_part:  # Проходим по строкам датасета.
-        joke = str(row[text_column]).strip()  # Берем текст шутки и убираем пробелы по краям.
-        joke = re.sub(r"\s+", " ", joke)  # Заменяем переносы строк и лишние пробелы одним пробелом.
-        if MIN_JOKE_LENGTH <= len(joke) <= MAX_JOKE_LENGTH:  # Проверяем, что шутка не слишком короткая и не слишком длинная.
-            jokes.append(joke)  # Добавляем шутку в список.
-        if len(jokes) >= MAX_JOKES:  # Проверяем, набрали ли мы достаточно шуток.
-            break  # Останавливаем загрузку, чтобы не держать слишком много данных.
-
-    if not jokes:  # Проверяем, что список шуток не пустой.
-        raise ValueError("Не получилось загрузить шутки из датасета.")  # Сообщаем понятную ошибку.
-
-    print(f"Загружено шуток: {len(jokes)}")  # Показываем, сколько шуток удалось взять.
-    return jokes  # Возвращаем список шуток.
+def find_text_column(dataset_part):
+    possible_names = ["jokes", "joke", "text", "content", "anekdot", "answer"]
+    for name in possible_names:
+        if name in dataset_part.column_names:
+            return name
+    for name in dataset_part.column_names:
+        if isinstance(dataset_part[0][name], str):
+            return name
+    raise ValueError("В датасете не найдена текстовая колонка со шутками.")
 
 
-class JokeAI:  # Создаем простой класс ИИ для выбора шуток.
-    def __init__(self, jokes):  # Описываем создание ИИ.
-        self.jokes = jokes  # Сохраняем все загруженные шутки внутри объекта.
-        self.word_weights = defaultdict(float)  # Создаем веса слов, которые будут меняться от оценок.
-        self.used_jokes = set()  # Создаем набор уже показанных шуток, чтобы меньше повторяться.
-        self.load_ratings()  # Загружаем старые оценки и дообучаемся на них.
+def load_jokes():
+    print("Загружаю датасет с русскими шутками...")
+    try:
+        dataset = load_dataset(DATASET_NAME)
+        split_name = "train" if "train" in dataset else list(dataset.keys())[0]
+        dataset_part = dataset[split_name]
+    except Exception:
+        csv_path = f"hf://datasets/{DATASET_NAME}/dataset.csv"
+        dataset_part = load_dataset("csv", data_files=csv_path, split="train")
 
-    def score_joke(self, joke, topic_words):  # Создаем функцию оценки шутки для выбора.
-        words = split_words(joke)  # Разбиваем шутку на слова.
-        topic_score = sum(3.0 for word in words if word in topic_words)  # Даем плюс за совпадение слов с темой.
-        user_score = sum(self.word_weights[word] for word in words)  # Добавляем опыт прошлых оценок пользователя.
-        random_score = random.uniform(0.0, 2.0)  # Добавляем немного случайности, чтобы ответы не были одинаковыми.
-        repeat_penalty = -100.0 if joke in self.used_jokes else 0.0  # Сильно штрафуем шутки, которые уже показывали.
-        return topic_score + user_score + random_score + repeat_penalty  # Возвращаем итоговый балл шутки.
+    text_column = find_text_column(dataset_part)
+    jokes = []
+    for row in dataset_part:
+        joke = re.sub(r"\s+", " ", str(row[text_column]).strip())
+        if MIN_JOKE_LENGTH <= len(joke) <= MAX_JOKE_LENGTH:
+            jokes.append(joke)
+        if len(jokes) >= MAX_JOKES:
+            break
 
-    def generate(self, topic):  # Создаем функцию генерации, точнее выбора шутки из датасета.
-        topic_words = set(split_words(topic))  # Превращаем тему пользователя в набор слов.
-        sample_size = min(400, len(self.jokes))  # Ограничиваем количество кандидатов, чтобы выбор был быстрым.
-        candidates = random.sample(self.jokes, sample_size)  # Берем случайные шутки-кандидаты из датасета.
-        best_joke = max(candidates, key=lambda joke: self.score_joke(joke, topic_words))  # Выбираем шутку с лучшим баллом.
-        self.used_jokes.add(best_joke)  # Запоминаем, что эту шутку уже показывали.
-        return best_joke  # Возвращаем выбранную шутку.
+    if not jokes:
+        raise ValueError("Не получилось загрузить шутки из датасета.")
+    print(f"Загружено шуток: {len(jokes)}")
+    return jokes
 
-    def learn_from_rating(self, joke, rating):  # Создаем функцию обучения на оценке пользователя.
-        words = split_words(joke)  # Разбиваем оцененную шутку на слова.
-        if rating >= GOOD_RATING:  # Проверяем, понравилась ли шутка.
-            change = 0.15  # Для хорошей оценки увеличиваем веса слов.
-        elif rating <= BAD_RATING:  # Проверяем, не понравилась ли шутка.
-            change = -0.15  # Для плохой оценки уменьшаем веса слов.
-        else:  # Обрабатываем нейтральную оценку 3.
-            change = 0.02  # Для нейтральной оценки меняем веса совсем чуть-чуть.
+# ─── Токенизатор ──────────────────────────────────────────────────────────────
 
-        for word in words:  # Проходим по каждому слову из шутки.
-            self.word_weights[word] += change  # Обновляем вес слова по оценке пользователя.
+class CharTokenizer:
+    """Символьный токенизатор — каждый символ = один токен."""
 
-    def save_rating(self, topic, joke, rating):  # Создаем функцию сохранения оценки в CSV.
-        file_exists = os.path.exists(RATINGS_FILE)  # Проверяем, существует ли файл с оценками.
-        with open(RATINGS_FILE, "a", encoding="utf-8", newline="") as file:  # Открываем файл для добавления строки.
-            writer = csv.writer(file)  # Создаем объект для записи CSV.
-            if not file_exists:  # Проверяем, нужно ли записать заголовок.
-                writer.writerow(["topic", "joke", "rating"])  # Записываем названия колонок.
-            writer.writerow([topic, joke, rating])  # Записываем тему, шутку и оценку.
+    def __init__(self, texts):
+        all_chars = sorted(set("".join(texts)))
+        self.vocab  = ["<pad>", "<unk>", "<s>", "</s>"] + all_chars
+        self.ch2id  = {ch: i for i, ch in enumerate(self.vocab)}
+        self.id2ch  = {i: ch for i, ch in enumerate(self.vocab)}
+        self.vocab_size = len(self.vocab)
+        self.pad_id = 0
+        self.eos_id = self.ch2id["</s>"]
 
-    def load_ratings(self):  # Создаем функцию загрузки старых оценок.
-        if not os.path.exists(RATINGS_FILE):  # Проверяем, есть ли файл с оценками.
-            return  # Если файла нет, просто выходим.
-        with open(RATINGS_FILE, "r", encoding="utf-8", newline="") as file:  # Открываем файл оценок для чтения.
-            reader = csv.DictReader(file)  # Читаем CSV как словарь.
-            for row in reader:  # Проходим по каждой старой оценке.
-                joke = row["joke"]  # Берем текст шутки.
-                rating = int(row["rating"])  # Берем оценку и превращаем ее в число.
-                self.learn_from_rating(joke, rating)  # Повторно обучаем ИИ на старой оценке.
+    def encode(self, text):
+        return [self.ch2id.get(ch, 1) for ch in text]
 
+    def decode(self, ids):
+        return "".join(self.id2ch.get(i, "?") for i in ids)
 
-def ask_rating():  # Создаем функцию, которая спрашивает оценку у пользователя.
-    while True:  # Запускаем цикл, пока пользователь не введет нормальную оценку.
-        text = input("Оцени шутку от 1 до 5: ").strip()  # Просим оценку и убираем лишние пробелы.
-        if text in ["выход", "exit", "quit"]:  # Проверяем, хочет ли пользователь выйти.
-            return None  # Возвращаем None как знак выхода.
-        if text in ["1", "2", "3", "4", "5"]:  # Проверяем, что введена оценка от 1 до 5.
-            return int(text)  # Возвращаем оценку числом.
-        print("Нужно ввести число от 1 до 5.")  # Подсказываем правильный формат ввода.
+    def save(self, path):
+        torch.save({"vocab": self.vocab}, path)
 
+    @classmethod
+    def load(cls, path):
+        obj = cls.__new__(cls)
+        data = torch.load(path, weights_only=True)
+        obj.vocab     = data["vocab"]
+        obj.ch2id     = {ch: i for i, ch in enumerate(obj.vocab)}
+        obj.id2ch     = {i: ch for i, ch in enumerate(obj.vocab)}
+        obj.vocab_size = len(obj.vocab)
+        obj.pad_id    = 0
+        obj.eos_id    = obj.ch2id["</s>"]
+        return obj
 
-def main():  # Создаем главную функцию программы.
-    jokes = load_jokes()  # Загружаем шутки из датасета.
-    ai = JokeAI(jokes)  # Создаем ИИ и обучаем его на старых оценках.
-    print("ИИ готов. Пиши тему шутки или 'выход'.")  # Сообщаем, что можно начинать.
+# ─── Датасет ──────────────────────────────────────────────────────────────────
 
-    while True:  # Запускаем основной цикл программы.
-        topic = input("\nТема шутки: ").strip().lower()  # Просим тему шутки у пользователя.
-        if topic in ["выход", "exit", "quit"]:  # Проверяем, хочет ли пользователь выйти.
-            print("Пока! Оценки сохранены, ИИ стал чуть умнее.")  # Печатаем прощальное сообщение.
-            break  # Завершаем цикл.
+class JokeDataset(Dataset):
+    def __init__(self, jokes, tokenizer, max_len=MAX_LEN):
+        self.samples = []
+        for joke in jokes:
+            ids = tokenizer.encode("<s>" + joke + "</s>")
+            for i in range(0, len(ids) - 1, max_len):
+                chunk = ids[i: i + max_len + 1]
+                if len(chunk) > 10:
+                    self.samples.append(chunk)
 
-        joke = ai.generate(topic)  # Генерируем шутку по теме.
-        print("\n" + joke)  # Печатаем шутку с пустой строкой перед ней.
-        rating = ask_rating()  # Просим пользователя оценить шутку.
-        if rating is None:  # Проверяем, попросил ли пользователь выйти во время оценки.
-            print("Пока! Оценки сохранены, ИИ стал чуть умнее.")  # Печатаем прощальное сообщение.
-            break  # Завершаем цикл.
-        ai.learn_from_rating(joke, rating)  # Дообучаем ИИ на новой оценке.
-        ai.save_rating(topic, joke, rating)  # Сохраняем оценку в файл.
-        print("Оценка сохранена. Следующая шутка будет учитывать твой вкус.")  # Сообщаем, что обучение применилось.
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        chunk = self.samples[idx]
+        return (torch.tensor(chunk[:-1], dtype=torch.long),
+                torch.tensor(chunk[1:],  dtype=torch.long))
 
 
-if __name__ == "__main__":  # Проверяем, запустили ли файл напрямую.
-    main()  # Запускаем главную функцию.
+def pad_collate(batch):
+    xs, ys = zip(*batch)
+    max_l = max(x.size(0) for x in xs)
+    xs = torch.stack([nn.functional.pad(x, (0, max_l - x.size(0))) for x in xs])
+    ys = torch.stack([nn.functional.pad(y, (0, max_l - y.size(0))) for y in ys])
+    return xs, ys
+
+# ─── Модель (маленький GPT) ───────────────────────────────────────────────────
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.heads    = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+
+        scale  = math.sqrt(self.head_dim)
+        scores = (q @ k.transpose(-2, -1)) / scale
+        mask   = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn   = torch.softmax(scores, dim=-1)
+        out    = (attn @ v).transpose(1, 2).reshape(B, T, C)
+        return self.out(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.attn = SelfAttention(dim, heads)
+        self.ff   = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
+        )
+        self.ln1 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
+        return x
+
+
+class TinyJokeGPT(nn.Module):
+    def __init__(self, vocab_size, dim=DIM, depth=DEPTH, heads=HEADS, max_len=MAX_LEN):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, dim)
+        self.pos_emb   = nn.Embedding(max_len, dim)
+        self.blocks    = nn.Sequential(*[TransformerBlock(dim, heads) for _ in range(depth)])
+        self.ln_final  = nn.LayerNorm(dim)
+        self.head      = nn.Linear(dim, vocab_size)
+
+    def forward(self, x):
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device).unsqueeze(0)
+        x   = self.token_emb(x) + self.pos_emb(pos)
+        x   = self.blocks(x)
+        return self.head(self.ln_final(x))
+
+# ─── Обучение и генерация ─────────────────────────────────────────────────────
+
+def train_model(model, dataset, epochs=EPOCHS):
+    loader    = DataLoader(dataset, batch_size=BATCH, shuffle=True, collate_fn=pad_collate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    loss_fn   = nn.CrossEntropyLoss(ignore_index=0)
+
+    model.train()
+    for epoch in range(epochs):
+        total = 0
+        for x, y in loader:
+            logits = model(x)
+            loss   = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total += loss.item()
+        print(f"  Эпоха {epoch + 1}/{epochs} | loss: {total / len(loader):.4f}")
+
+
+def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.8):
+    model.eval()
+    ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long)
+
+    with torch.no_grad():
+        for _ in range(max_new):
+            # Обрезаем до MAX_LEN если слишком длинно
+            inp    = ids[:, -MAX_LEN:]
+            logits = model(inp)
+            next_logits = logits[0, -1] / temperature
+            probs   = torch.softmax(next_logits, dim=-1)
+            next_id = torch.multinomial(probs, 1).item()
+
+            if next_id == tokenizer.eos_id:
+                break
+
+            ids = torch.cat([ids, torch.tensor([[next_id]])], dim=1)
+
+    result = tokenizer.decode(ids[0].tolist())
+    # Убираем служебные токены
+    result = result.replace("<s>", "").replace("</s>", "").strip()
+    return result
+
+# ─── Главный класс ИИ ─────────────────────────────────────────────────────────
+
+class JokeAI:
+    def __init__(self, jokes):
+        self.jokes       = jokes
+        self.word_weights = defaultdict(float)
+        self.used_jokes  = set()
+
+        # Загружаем или обучаем модель
+        if os.path.exists(MODEL_FILE) and os.path.exists(TOKENIZER_FILE):
+            print("Загружаю сохранённую модель...")
+            self.tokenizer = CharTokenizer.load(TOKENIZER_FILE)
+            self.gpt = TinyJokeGPT(vocab_size=self.tokenizer.vocab_size)
+            self.gpt.load_state_dict(torch.load(MODEL_FILE, weights_only=True))
+            print("Модель загружена!")
+        else:
+            print("Обучаю свою модель с нуля (первый запуск)...")
+            self.tokenizer = CharTokenizer(jokes)
+            dataset        = JokeDataset(jokes, self.tokenizer)
+            self.gpt       = TinyJokeGPT(vocab_size=self.tokenizer.vocab_size)
+            print(f"Параметров в модели: {sum(p.numel() for p in self.gpt.parameters()):,}")
+            train_model(self.gpt, dataset)
+            torch.save(self.gpt.state_dict(), MODEL_FILE)
+            self.tokenizer.save(TOKENIZER_FILE)
+            print("Модель сохранена!")
+
+        self.load_ratings()
+
+    def generate(self, topic):
+        # Даём модели тему как начало шутки
+        prompt = f"<s>{topic} —"
+        joke   = generate_joke(self.gpt, self.tokenizer, prompt)
+        return joke if joke else "Не смог придумать шутку, попробуй другую тему."
+
+    def learn_from_rating(self, joke, rating):
+        words = split_words(joke)
+        if rating >= GOOD_RATING:
+            change = 0.15
+        elif rating <= BAD_RATING:
+            change = -0.15
+        else:
+            change = 0.02
+        for word in words:
+            self.word_weights[word] += change
+
+    def save_rating(self, topic, joke, rating):
+        file_exists = os.path.exists(RATINGS_FILE)
+        with open(RATINGS_FILE, "a", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow(["topic", "joke", "rating"])
+            writer.writerow([topic, joke, rating])
+
+    def load_ratings(self):
+        if not os.path.exists(RATINGS_FILE):
+            return
+        with open(RATINGS_FILE, "r", encoding="utf-8", newline="") as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                self.learn_from_rating(row["joke"], int(row["rating"]))
+
+# ─── Интерфейс ────────────────────────────────────────────────────────────────
+
+def ask_rating():
+    while True:
+        text = input("Оцени шутку от 1 до 5: ").strip()
+        if text in ["выход", "exit", "quit"]:
+            return None
+        if text in ["1", "2", "3", "4", "5"]:
+            return int(text)
+        print("Нужно ввести число от 1 до 5.")
+
+
+def main():
+    jokes = load_jokes()
+    ai    = JokeAI(jokes)
+    print("\nИИ готов. Пиши тему шутки или 'выход'.")
+
+    while True:
+        topic = input("\nТема шутки: ").strip().lower()
+        if topic in ["выход", "exit", "quit"]:
+            print("Пока! Оценки сохранены, ИИ стал чуть умнее.")
+            break
+
+        joke = ai.generate(topic)
+        print("\n" + joke)
+
+        rating = ask_rating()
+        if rating is None:
+            print("Пока! Оценки сохранены, ИИ стал чуть умнее.")
+            break
+
+        ai.learn_from_rating(joke, rating)
+        ai.save_rating(topic, joke, rating)
+        print("Оценка сохранена. Следующая шутка будет учитывать твой вкус.")
+
+
+if __name__ == "__main__":
+    main()
