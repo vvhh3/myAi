@@ -1,5 +1,5 @@
 #  ЧТО ТУТ ПРОИСХОДИТ (коротко):
-#  1. Загружаем ~5000 русских анекдотов
+#  1. Загружаем ~50000 русских анекдотов
 #  2. Разбиваем текст на символы (каждый символ = токен)
 #  3. Обучаем Трансформер (тот самый «T» в GPT) предсказывать
 #     следующий символ по предыдущим
@@ -44,11 +44,11 @@ BAD_RATING     = 2                              # оценка 2- считает
 
 # Гиперпараметры модели — меняй если нужно
 # Гиперпараметры — это настройки архитектуры нейросети, которые мы выбираем ДО обучения
-DIM      = 384   # размерность эмбеддингов (чем больше, тем умнее, но медленнее)
-DEPTH    = 8     # количество слоёв Трансформера (глубина сети)
-HEADS    = 6     # количество «голов» внимания (сколько точек зрения одновременно)
-MAX_LEN  = 200   # максимальная длина последовательности в токенах
-EPOCHS   = 20    # сколько раз пройдём весь датасет
+DIM      = 320   # размерность эмбеддингов (чем больше, тем умнее, но медленнее)
+DEPTH    = 6     # количество слоёв Трансформера (глубина сети)
+HEADS    = 5     # количество «голов» внимания (сколько точек зрения одновременно)
+MAX_LEN  = 128   # максимальная длина последовательности в токенах
+EPOCHS   = 10    # сколько раз пройдём весь датасет
 BATCH    = 64    # сколько примеров обрабатываем за один шаг
 
 # Создаём папку Ai, если её нет
@@ -58,6 +58,7 @@ BATCH    = 64    # сколько примеров обрабатываем за
 if not os.path.exists(RATINGS_FILE):
     with open(RATINGS_FILE, "w", encoding="utf-8") as f:
         f.write("topic,joke,rating\n")  # заголовок CSV
+
 
 # ─── Загрузка датасета ────────────────────────────────────────────────────────
 # Датасет — это набор данных, на котором мы учим нейросеть.
@@ -99,7 +100,10 @@ def load_jokes():
     for row in dataset_part:
         joke = re.sub(r"\s+", " ", str(row[text_column]).strip())
 
-        if MIN_JOKE_LENGTH <= len(joke) <= MAX_JOKE_LENGTH:
+        if (
+            MIN_JOKE_LENGTH <= len(joke) <= MAX_JOKE_LENGTH
+            and len(set(joke)) > 20   # убираем мусор/повторы/спам
+        ):
             jokes.append(joke)
 
     # 🔥 ВАЖНО: перемешиваем, а не берём первые
@@ -190,20 +194,29 @@ class BPETokenizer:
             self.tokenizer.pre_tokenizer = Whitespace()
 
             trainer = BpeTrainer(
-                vocab_size=8000,   # 🔥 важный параметр
+                vocab_size=8000,
                 special_tokens=["<pad>", "<unk>", "<s>", "</s>"]
             )
 
             self.tokenizer.train_from_iterator(texts, trainer)
 
-        self.pad_id = 0
+        # ✔ ЯВНО фиксируем токены
+        self.pad_id = self.tokenizer.token_to_id("<pad>")
+        self.unk_id = self.tokenizer.token_to_id("<unk>")
+        self.bos_id = self.tokenizer.token_to_id("<s>")
         self.eos_id = self.tokenizer.token_to_id("</s>")
 
+    @property
+    def vocab_size(self):
+        return self.tokenizer.get_vocab_size()
+
     def encode(self, text):
-        return self.tokenizer.encode(text).ids
+        # ✔ теперь ВСЕГДА добавляем спец-токены
+        return self.tokenizer.encode("<s> " + text + " </s>").ids
 
     def decode(self, ids):
-        return self.tokenizer.decode(ids)
+        text = self.tokenizer.decode(ids)
+        return text.replace("<s>", "").replace("</s>", "").strip()
 
     def save(self, path):
         self.tokenizer.save(path)
@@ -227,7 +240,7 @@ class JokeDataset(Dataset):
             ids = tokenizer.encode("<s>" + joke + "</s>")
             # Режем на кусочки по max_len символов
             # Шутка может быть длиннее max_len, поэтому нарезаем с перекрытием
-            for i in range(0, len(ids) - 1, max_len):
+            for i in range(0, len(ids) - 1, max_len // 2):
                 chunk = ids[i: i + max_len + 1]  # берём кусочек
                 if len(chunk) > 10:  # слишком короткие кусочки отбрасываем
                     self.samples.append(chunk)
@@ -251,20 +264,32 @@ class JokeDataset(Dataset):
 
 
 def pad_collate(batch):
-    """Собирает несколько примеров в один батч и дополняет до одинаковой длины.
-    
-    Проблема: разные примеры разной длины. Нейросети нужно, чтобы
-    все примеры в батче были одинаковой длины. Решение: дополняем
-    короткие примеры токенами <pad> (номер 0).
-    """
-    xs, ys = zip(*batch)  # разделяем на входы и цели
-    max_l = max(x.size(0) for x in xs)  # находим самую длинную последовательность
-    
-    # Для каждого примера: если он короче max_l, дополняем нулями справа
-    # nn.functional.pad(x, (0, max_l - x.size(0))) добавляет нули в конец
-    xs = torch.stack([nn.functional.pad(x, (0, max_l - x.size(0))) for x in xs])
-    ys = torch.stack([nn.functional.pad(y, (0, max_l - y.size(0))) for y in ys])
-    return xs, ys
+    xs, ys = zip(*batch)
+    max_l = max(x.size(0) for x in xs)
+
+    xs_pad = []
+    ys_pad = []
+    masks = []
+
+    for x, y in zip(xs, ys):
+        pad_len = max_l - x.size(0)
+
+        xs_pad.append(nn.functional.pad(x, (0, pad_len)))
+        ys_pad.append(nn.functional.pad(y, (0, pad_len)))
+
+        # 1 = реальный токен, 0 = паддинг
+        masks.append(
+            torch.cat([
+                torch.ones(len(x), dtype=torch.bool),
+                torch.zeros(pad_len, dtype=torch.bool)
+            ])
+        )
+
+    return (
+        torch.stack(xs_pad),
+        torch.stack(ys_pad),
+        torch.stack(masks)
+    )
 
 # ─── Модель (маленький GPT) ───────────────────────────────────────────────────
 #    ╔══════════════════════════════════════════════════════════╗
@@ -304,46 +329,31 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3)  # Query, Key, Value в одной матрице
         self.out = nn.Linear(dim, dim)      # выходной линейный слой
 
-    def forward(self, x):
-        # x — входной тензор формы (Batch, Time, Channels)
-        # B = количество примеров в батче
-        # T = длина последовательности (сколько токенов)
-        # C = размерность эмбеддинга (dim)
+    def forward(self, x, mask=None):
         B, T, C = x.shape
-        
-        # Считаем Q, K, V одним умножением на матрицу, потом разделяем
-        # qkv(x) даёт тензор (B, T, C*3), chunk делит на 3 части по оси C
+
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        
-        # Разделяем на головы: (B, T, heads, head_dim)
-        # transpos(1,2) меняет T и heads местами: (B, heads, T, head_dim)
+
         q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
 
-        # Считаем внимание:
-        # 1. Q * K^T (матричное умножение) — получаем «оценки внимания»
-        # 2. Делим на sqrt(head_dim) — это масштабирование, чтобы градиенты не взрывались
-        scale  = math.sqrt(self.head_dim)
-        scores = (q @ k.transpose(-2, -1)) / scale  # (B, heads, T, T)
-        
-        # Маска — запрещаем токенам «заглядывать в будущее»
-        # Это ключевая идея decoder-only трансформеров (как GPT):
-        # токен на позиции i может смотреть только на позиции j <= i
-        # Иначе модель будет «жульничать» — подглядывать ответ
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        # Заменяем верхний треугольник (будущее) на -∞
-        # После softmax это даст 0 — то есть запрет на внимание в будущее
-        scores = scores.masked_fill(mask, float("-inf"))
-        
-        # Softmax превращает оценки в вероятности (сумма = 1)
-        attn = torch.softmax(scores, dim=-1)  # (B, heads, T, T)
-        
-        # Умножаем вероятности на V — получаем взвешенную сумму
-        # transpose(1,2) и reshape возвращают форму (B, T, C)
+        scale = math.sqrt(self.head_dim)
+        scores = (q @ k.transpose(-2, -1)) / scale
+
+        # causal mask (как было)
+        causal = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        scores = scores.masked_fill(causal, float("-inf"))
+
+        # padding mask (НОРМАЛЬНОЕ исправление)
+        if mask is not None:
+            mask = mask[:, None, None, :]  # (B,1,1,T)
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)
+
         out = (attn @ v).transpose(1, 2).reshape(B, T, C)
-        
-        # Выходной линейный слой
+
         return self.out(out)
 
 
@@ -376,10 +386,8 @@ class TransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(dim)  # нормализация перед вниманием
         self.ln2 = nn.LayerNorm(dim)  # нормализация перед FFN
 
-    def forward(self, x):
-        # Внимание с остаточной связью:
-        x = x + self.attn(self.ln1(x))
-        # FeedForward с остаточной связью:
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln1(x), mask)
         x = x + self.ff(self.ln2(x))
         return x
 
@@ -406,27 +414,22 @@ class TinyJokeGPT(nn.Module):
         self.pos_emb   = nn.Embedding(max_len, dim)
         
         # Стек из depth блоков Трансформера
-        self.blocks    = nn.Sequential(
-            *[TransformerBlock(dim, heads) for _ in range(depth)]
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(dim, heads) for _ in range(depth)]
         )
         
         self.ln_final  = nn.LayerNorm(dim)    # финальная нормализация
         self.head      = nn.Linear(dim, vocab_size)  # предсказание следующего токена
 
-    def forward(self, x):
-        B, T = x.shape  # B = размер батча, T = длина последовательности
-        pos = torch.arange(T, device=x.device).unsqueeze(0)  # позиции [0, 1, 2, ..., T-1]
-        
-        # Складываем эмбеддинги токенов и позиций
-        # Вектор каждого токена = смысл токена + его позиция
+    def forward(self, x, mask=None):
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device).unsqueeze(0)
+
         x = self.token_emb(x) + self.pos_emb(pos)
-        
-        # Пропускаем через все блоки Трансформера
-        x = self.blocks(x)
-        
-        # Финальный линейный слой: из вектора размерности dim
-        # получаем вероятности для каждого токена из словаря
-        return self.head(self.ln_final(x))
+        for block in self.blocks:
+            x = block(x, mask=mask)
+        x = self.ln_final(x)
+        return self.head(x)
 
 # ─── Обучение и генерация ─────────────────────────────────────────────────────
 # Обучение — это процесс подбора весов нейросети так, чтобы
@@ -445,10 +448,11 @@ def train_model(model, dataset, tokenizer, epochs=EPOCHS):
     """
     # DataLoader — разбивает датасет на батчи и перемешивает
     loader = DataLoader(dataset, batch_size=BATCH, shuffle=True, collate_fn=pad_collate)
-    
+    generator=torch.Generator().manual_seed(42)
+
     # AdamW — оптимизатор, который решает, КАК менять веса
     # lr (learning rate) — скорость обучения: как сильно менять веса за шаг
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
     
     # Функция потерь — считает, насколько ошиблась модель
     # CrossEntropyLoss — для задачи классификации (какой токен следующий?)
@@ -470,25 +474,23 @@ def train_model(model, dataset, tokenizer, epochs=EPOCHS):
     for epoch in range(start_epoch, epochs):
         total = 0  # сумма потерь за эпоху
         
-        for x, y in loader:
-            # x — входные токены (B, T)
-            # y — целевые токены (B, T) — сдвинуты на 1 вправо
-            
-            logits = model(x)  # предсказание модели (B, T, vocab_size)
-            
-            # Сравниваем предсказание с правильным ответом
-            # view(-1, ...) — превращаем в плоский тензор для подсчёта loss
-            loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
-            
-            optimizer.zero_grad()  # обнуляем градиенты (они накапливаются)
-            loss.backward()        # считаем градиенты (обратное распространение)
-            
-            # Обрезаем градиенты — чтобы они не стали слишком большими
-            # (проблема «взрывающихся градиентов»)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
-            optimizer.step()  # делаем шаг оптимизации (меняем веса)
-            total += loss.item()  # добавляем потерю к общей сумме
+    for i, (x, y, mask) in enumerate(loader):
+        logits = model(x, mask)
+
+        loss = loss_fn(
+            logits.view(-1, logits.size(-1)),
+            y.view(-1)
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total += loss.item()
+
+    if i % 50 == 0:
+        print(f"Batch {i}/{len(loader)} | loss: {loss.item():.4f}")
 
         avg_loss = total / len(loader)  # средняя потеря за эпоху
         print(f"  Эпоха {epoch + 1}/{epochs} | loss: {avg_loss:.4f}")
@@ -506,7 +508,7 @@ def train_model(model, dataset, tokenizer, epochs=EPOCHS):
     os.remove("joke_checkpoint.pt")  # промежуточный чекпоинт больше не нужен
 
 
-def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.8):
+def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.7):
     """Генерирует текст, предсказывая по одному токену за раз.
     
     Как работает генерация:
@@ -541,7 +543,7 @@ def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.8):
             
             # Сэмплируем (выбираем) следующий токен согласно вероятностям
             # torch.multinomial — случайный выбор с заданными вероятностями
-            topk = 40
+            topk = 20
             values, indices = torch.topk(probs, topk)
             values = values / values.sum()
             next_id = indices[torch.multinomial(values, 1)].item()
@@ -579,8 +581,8 @@ class JokeAI:
         else:
             print("Обучаю свою модель с нуля (первый запуск)...")
             self.tokenizer = BPETokenizer(jokes)           # создаём токенизатор
-            dataset        = JokeDataset(jokes, self.tokenizer)  # создаём датасет
-            self.gpt       = TinyJokeGPT(vocab_size=self.tokenizer.vocab_size)
+            dataset = JokeDataset(jokes, self.tokenizer)  # создаём датасет
+            self.gpt = TinyJokeGPT(vocab_size= self.tokenizer.vocab_size)
             # Считаем и выводим количество параметров модели
             print(f"Параметров в модели: {sum(p.numel() for p in self.gpt.parameters()):,}")
             train_model(self.gpt, dataset, self.tokenizer)
