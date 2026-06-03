@@ -27,7 +27,7 @@ DIM      = 256   # размер векторов (больше = умнее, н�
 DEPTH    = 6     # количество слоёв трансформера
 HEADS    = 4     # количество голов внимания
 MAX_LEN  = 200   # максимальная длина в токенах
-EPOCHS   = 40    # количество эпох обучения
+EPOCHS   = 20    # количество эпох обучения
 BATCH    = 32    # размер батча
 
 os.makedirs("Ai", exist_ok=True)
@@ -200,13 +200,22 @@ class TinyJokeGPT(nn.Module):
 
 # ─── Обучение и генерация ─────────────────────────────────────────────────────
 
-def train_model(model, dataset, epochs=EPOCHS):
+def train_model(model, dataset, tokenizer, epochs=EPOCHS):
     loader    = DataLoader(dataset, batch_size=BATCH, shuffle=True, collate_fn=pad_collate)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     loss_fn   = nn.CrossEntropyLoss(ignore_index=0)
 
+    # Проверяем, есть ли сохранённый прогресс
+    start_epoch = 0
+    if os.path.exists("joke_checkpoint.pt"):
+        checkpoint = torch.load("joke_checkpoint.pt", weights_only=True)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = checkpoint["epoch"]
+        print(f"Продолжаю с эпохи {start_epoch + 1}")
+
     model.train()
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         total = 0
         for x, y in loader:
             logits = model(x)
@@ -216,7 +225,21 @@ def train_model(model, dataset, epochs=EPOCHS):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total += loss.item()
-        print(f"  Эпоха {epoch + 1}/{epochs} | loss: {total / len(loader):.4f}")
+
+        avg_loss = total / len(loader)
+        print(f"  Эпоха {epoch + 1}/{epochs} | loss: {avg_loss:.4f}")
+
+        # Сохраняем прогресс после каждой эпохи
+        torch.save({
+            "epoch":     epoch + 1,
+            "model":     model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        }, "joke_checkpoint.pt")
+
+    # Финальное сохранение готовой модели
+    torch.save(model.state_dict(), MODEL_FILE)
+    tokenizer.save(TOKENIZER_FILE)
+    os.remove("joke_checkpoint.pt")
 
 
 def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.8):
@@ -263,9 +286,7 @@ class JokeAI:
             dataset        = JokeDataset(jokes, self.tokenizer)
             self.gpt       = TinyJokeGPT(vocab_size=self.tokenizer.vocab_size)
             print(f"Параметров в модели: {sum(p.numel() for p in self.gpt.parameters()):,}")
-            train_model(self.gpt, dataset)
-            torch.save(self.gpt.state_dict(), MODEL_FILE)
-            self.tokenizer.save(TOKENIZER_FILE)
+            train_model(self.gpt, dataset, self.tokenizer)
             print("Модель сохранена!")
 
         self.load_ratings()
