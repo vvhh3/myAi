@@ -25,7 +25,7 @@ DATASET_NAME   = "IgorVolochay/russian_jokes"  # имя датасета с Hugg
 RATINGS_FILE   = "ratings.csv"                  # файл, куда сохраняем оценки
 MODEL_FILE     = "joke_model.pt"                # файл с весами обученной модели
 TOKENIZER_FILE = "joke_tokenizer.pt"            # файл со словарём токенов
-MAX_JOKES      = 10000                          # сколько шуток загружать макс.
+MAX_JOKES      = 15000                          # сколько шуток загружать макс.
 MIN_JOKE_LENGTH = 20                            # минимальная длина шутки (символов)
 MAX_JOKE_LENGTH = 500                           # максимальная длина шутки (символов)
 GOOD_RATING    = 4                              # оценка 4+ считается хорошей
@@ -33,11 +33,12 @@ BAD_RATING     = 2                              # оценка 2- считает
 
 # Гиперпараметры модели — меняй если нужно
 # Гиперпараметры — это настройки архитектуры нейросети, которые мы выбираем ДО обучения
+# HEADS должен делить DIM без остатка
 DIM = 200   # размерность эмбеддингов (чем больше, тем умнее, но медленнее)
 DEPTH  = 5     # количество слоёв Трансформера (глубина сети)
 HEADS = 5     # количество «голов» внимания (сколько точек зрения одновременно)
 MAX_LEN = 150   # максимальная длина последовательности в токенах
-EPOCHS = 2    # сколько раз пройдём весь датасет
+EPOCHS = 5    # сколько раз пройдём весь датасет (20 эпох)
 BATCH  = 64    # сколько примеров обрабатываем за один шаг
 
 
@@ -611,8 +612,7 @@ class JokeAI:
         joke = generate_joke(self.gpt, self.tokenizer, prompt)
         return joke if joke else "Не смог придумать шутку, попробуй ещё раз."
 
-    def learn_from_rating(self, joke, rating):
-    # Старые веса слов (оставляем для совместимости с CSV)
+    def learn_from_rating(self, joke, rating, silent=False):
         words = split_words(joke)
         if rating >= GOOD_RATING:
             change = 0.15
@@ -622,14 +622,14 @@ class JokeAI:
             change = 0.02
         for word in words:
             self.word_weights[word] += change
-    
-        # Новое — дообучаем нейросеть
+
         finetune_on_joke(self.gpt, self.tokenizer, joke, rating, self.ft_optimizer)
-    
-        if rating >= GOOD_RATING:
-            print("  [ИИ запомнил эту шутку как хорошую]")
-        elif rating <= BAD_RATING:
-            print("  [ИИ постарается не генерировать такое]")
+
+        if not silent: 
+            if rating >= GOOD_RATING:
+                print("  [ИИ запомнил эту шутку как хорошую]")
+            elif rating <= BAD_RATING:
+                print("  [ИИ постарается не генерировать такое]")
             
     def save_rating(self, topic, joke, rating):
         """Сохраняет оценку в CSV-файл."""
