@@ -34,12 +34,12 @@ BAD_RATING     = 2                              # оценка 2- считает
 # Гиперпараметры модели — меняй если нужно
 # Гиперпараметры — это настройки архитектуры нейросети, которые мы выбираем ДО обучения
 # HEADS должен делить DIM без остатка
-DIM = 200   # размерность эмбеддингов (чем больше, тем умнее, но медленнее)
-DEPTH  = 5     # количество слоёв Трансформера (глубина сети)
-HEADS = 5     # количество «голов» внимания (сколько точек зрения одновременно)
-MAX_LEN = 150   # максимальная длина последовательности в токенах
-EPOCHS = 8    # сколько раз пройдём весь датасет (23 эпох)
-BATCH  = 64    # сколько примеров обрабатываем за один шаг
+DIM = 384   # размерность эмбеддингов (чем больше, тем умнее, но медленнее)
+DEPTH  = 6     # количество слоёв Трансформера (глубина сети)
+HEADS = 6     # количество «голов» внимания (сколько точек зрения одновременно)
+MAX_LEN = 128   # максимальная длина последовательности в токенах
+EPOCHS = 5    # сколько раз пройдём весь датасет (5 эпох)
+BATCH  = 32    # сколько примеров обрабатываем за один шаг
 
 
 # Если файла с оценками нет — создаём с заголовком
@@ -48,7 +48,7 @@ if not os.path.exists(RATINGS_FILE):
         f.write("topic,joke,rating\n")  # заголовок CSV
 
 
-# ─── Загрузка датасета ────────────────────────────────────────────────────────
+# ─── Загрузка датасета ───────────────────────────────────────────────────────
 # Датасет — это набор данных, на котором мы учим нейросеть.
 # В нашем случае — коллекция русских анекдотов.
 
@@ -110,108 +110,108 @@ def load_jokes():
 # Это самый простой способ. ChatGPT использует более сложный (BPE),
 # но принцип тот же.
 
-class CharTokenizer:
-    """Символьный токенизатор — каждый символ = один токен.
+# class CharTokenizer:
+#     """Символьный токенизатор — каждый символ = один токен.
     
-    Принцип: составляем словарь всех символов, которые встречаются в тексте,
-    и каждому даём номер. Теперь текст можно представить как список чисел.
-    """
+#     Принцип: составляем словарь всех символов, которые встречаются в тексте,
+#     и каждому даём номер. Теперь текст можно представить как список чисел.
+#     """
 
-    def __init__(self, texts):
-        # texts — список всех шуток. Собираем ВСЕ уникальные символы из них
-        all_chars = sorted(set("".join(texts)))
+#     def __init__(self, texts):
+#         # texts — список всех шуток. Собираем ВСЕ уникальные символы из них
+#         all_chars = sorted(set("".join(texts)))
         
-        # Словарь: 4 специальных токена + все найденные символы
-        self.vocab  = ["<pad>", "<unk>", "<s>", "</s>"] + all_chars
-        # <pad>  — заполнитель (padding), чтобы все последовательности были одной длины
-        # <unk>  — неизвестный символ (если встретится новый на генерации)
-        # <s>    — начало последовательности (start)
-        # </s>   — конец последовательности (end)
+#         # Словарь: 4 специальных токена + все найденные символы
+#         self.vocab  = ["<pad>", "<unk>", "<s>", "</s>"] + all_chars
+#         # <pad>  — заполнитель (padding), чтобы все последовательности были одной длины
+#         # <unk>  — неизвестный символ (если встретится новый на генерации)
+#         # <s>    — начало последовательности (start)
+#         # </s>   — конец последовательности (end)
         
-        # Создаём два словаря: символ → номер и номер → символ
-        self.ch2id  = {ch: i for i, ch in enumerate(self.vocab)}  # 'а' → 5
-        self.id2ch  = {i: ch for i, ch in enumerate(self.vocab)}  # 5 → 'а'
+#         # Создаём два словаря: символ → номер и номер → символ
+#         self.ch2id  = {ch: i for i, ch in enumerate(self.vocab)}  # 'а' → 5
+#         self.id2ch  = {i: ch for i, ch in enumerate(self.vocab)}  # 5 → 'а'
         
-        self.vocab_size = len(self.vocab)  # размер словаря (сколько всего токенов)
-        self.pad_id = 0      # номер токена <pad>
-        self.eos_id = self.ch2id["</s>"]  # номер токена конца строки
-
-    def encode(self, text):
-        """Превращает строку в список чисел (токенов).
-        
-        Пример: encode("привет") → [4, 27, 16, 12, 9, 28]
-        """
-        # Для каждого символа берём его номер из словаря.
-        # Если символа нет в словаре — используем <unk> (номер 1)
-        return [self.ch2id.get(ch, 1) for ch in text]
-
-    def decode(self, ids):
-        """Превращает список чисел обратно в строку.
-        
-        Пример: decode([4, 27, 16, 12, 9, 28]) → "привет"
-        """
-        return "".join(self.id2ch.get(i, "?") for i in ids)
-
-    def save(self, path):
-        """Сохраняет токенизатор в файл (словарь символов)."""
-        torch.save({"vocab": self.vocab}, path)
-
-    @classmethod
-    def load(cls, path):
-        """Загружает токенизатор из файла.
-        
-        @classmethod — это метод класса, а не экземпляра.
-        Он вызывается как CharTokenizer.load(path) и возвращает новый объект.
-        """
-        obj = cls.__new__(cls)  # создаём объект без вызова __init__
-        data = torch.load(path, weights_only=True)  # загружаем словарь
-        obj.vocab     = data["vocab"]
-        obj.ch2id     = {ch: i for i, ch in enumerate(obj.vocab)}
-        obj.id2ch     = {i: ch for i, ch in enumerate(obj.vocab)}
-        obj.vocab_size = len(obj.vocab)
-        obj.pad_id    = 0
-        obj.eos_id    = obj.ch2id["</s>"]
-        return obj
-
-# class BPETokenizer:
-#     def __init__(self, texts=None, path=None):
-#         if path:
-#             self.tokenizer = Tokenizer.from_file(path)
-#         else:
-#             self.tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-#             self.tokenizer.pre_tokenizer = Whitespace()
-
-#             trainer = BpeTrainer(
-#                 vocab_size=8000,
-#                 special_tokens=["<pad>", "<unk>", "<s>", "</s>"]
-#             )
-
-#             self.tokenizer.train_from_iterator(texts, trainer)
-
-#         # ✔ ЯВНО фиксируем токены
-#         self.pad_id = self.tokenizer.token_to_id("<pad>")
-#         self.unk_id = self.tokenizer.token_to_id("<unk>")
-#         self.bos_id = self.tokenizer.token_to_id("<s>")
-#         self.eos_id = self.tokenizer.token_to_id("</s>")
-
-#     @property
-#     def vocab_size(self):
-#         return self.tokenizer.get_vocab_size()
+#         self.vocab_size = len(self.vocab)  # размер словаря (сколько всего токенов)
+#         self.pad_id = 0      # номер токена <pad>
+#         self.eos_id = self.ch2id["</s>"]  # номер токена конца строки
 
 #     def encode(self, text):
-#         # ✔ теперь ВСЕГДА добавляем спец-токены
-#         return self.tokenizer.encode("<s> " + text + " </s>").ids
+#         """Превращает строку в список чисел (токенов).
+        
+#         Пример: encode("привет") → [4, 27, 16, 12, 9, 28]
+#         """
+#         # Для каждого символа берём его номер из словаря.
+#         # Если символа нет в словаре — используем <unk> (номер 1)
+#         return [self.ch2id.get(ch, 1) for ch in text]
 
 #     def decode(self, ids):
-#         text = self.tokenizer.decode(ids)
-#         return text.replace("<s>", "").replace("</s>", "").strip()
+#         """Превращает список чисел обратно в строку.
+        
+#         Пример: decode([4, 27, 16, 12, 9, 28]) → "привет"
+#         """
+#         return "".join(self.id2ch.get(i, "?") for i in ids)
 
 #     def save(self, path):
-#         self.tokenizer.save(path)
+#         """Сохраняет токенизатор в файл (словарь символов)."""
+#         torch.save({"vocab": self.vocab}, path)
 
 #     @classmethod
 #     def load(cls, path):
-#         return cls(path=path)
+#         """Загружает токенизатор из файла.
+        
+#         @classmethod — это метод класса, а не экземпляра.
+#         Он вызывается как CharTokenizer.load(path) и возвращает новый объект.
+#         """
+#         obj = cls.__new__(cls)  # создаём объект без вызова __init__
+#         data = torch.load(path, weights_only=True)  # загружаем словарь
+#         obj.vocab     = data["vocab"]
+#         obj.ch2id     = {ch: i for i, ch in enumerate(obj.vocab)}
+#         obj.id2ch     = {i: ch for i, ch in enumerate(obj.vocab)}
+#         obj.vocab_size = len(obj.vocab)
+#         obj.pad_id    = 0
+#         obj.eos_id    = obj.ch2id["</s>"]
+#         return obj
+
+class BPETokenizer:
+    def __init__(self, texts=None, path=None):
+        if path:
+            self.tokenizer = Tokenizer.from_file(path)
+        else:
+            self.tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+            self.tokenizer.pre_tokenizer = Whitespace()
+
+            trainer = BpeTrainer(
+                vocab_size=8000,
+                special_tokens=["<pad>", "<unk>", "<s>", "</s>"]
+            )
+
+            self.tokenizer.train_from_iterator(texts, trainer)
+
+        # ✔ ЯВНО фиксируем токены
+        self.pad_id = self.tokenizer.token_to_id("<pad>")
+        self.unk_id = self.tokenizer.token_to_id("<unk>")
+        self.bos_id = self.tokenizer.token_to_id("<s>")
+        self.eos_id = self.tokenizer.token_to_id("</s>")
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.get_vocab_size()
+
+    def encode(self, text):
+        # ✔ теперь ВСЕГДА добавляем спец-токены
+        return self.tokenizer.encode("<s> " + text + " </s>").ids
+
+    def decode(self, ids):
+        text = self.tokenizer.decode(ids)
+        return text.replace("<s>", "").replace("</s>", "").strip()
+
+    def save(self, path):
+        self.tokenizer.save(path)
+
+    @classmethod
+    def load(cls, path):
+        return cls(path=path)
 
 # ─── Датасет ──────────────────────────────────────────────────────────────────
 # Датасет в PyTorch — это класс, который выдаёт пары (вход, цель).
@@ -225,7 +225,7 @@ class JokeDataset(Dataset):
         self.samples = []  # список примеров для обучения
         for joke in jokes:
             # Превращаем шутку в числа и добавляем маркеры начала/конца
-            ids = tokenizer.encode("<s>" + joke + "</s>")
+            ids = tokenizer.encode(joke)
             # Режем на кусочки по max_len символов
             # Шутка может быть длиннее max_len, поэтому нарезаем с перекрытием
             for i in range(0, len(ids) - 1, max_len // 2):
@@ -485,7 +485,7 @@ def train_model(model, dataset, tokenizer, epochs=EPOCHS):
     os.remove("joke_checkpoint.pt")  # промежуточный чекпоинт больше не нужен
 
 
-def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.7):
+def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.9):
     """Генерирует текст, предсказывая по одному токену за раз.
     
     Как работает генерация:
@@ -520,7 +520,7 @@ def generate_joke(model, tokenizer, prompt, max_new=150, temperature=0.7):
             
             # Сэмплируем (выбираем) следующий токен согласно вероятностям
             # torch.multinomial — случайный выбор с заданными вероятностями
-            topk = 20
+            topk = 50
             values, indices = torch.topk(probs, topk)
             values = values / values.sum()
             next_id = indices[torch.multinomial(values, 1)].item()
@@ -544,37 +544,32 @@ def finetune_on_joke(model, tokenizer, joke, rating, optimizer=None):
         return
 
     model.train()
-
     if optimizer is None:
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-    ids = tokenizer.encode("<s>" + joke + "</s>")
+    ids = tokenizer.encode(joke)
     if len(ids) < 3:
         return
 
-    # Обрезаем так чтобы x имел длину не больше MAX_LEN
     ids = ids[:MAX_LEN + 1]
-
-    x = torch.tensor([ids[:-1]], dtype=torch.long)  # длина <= MAX_LEN
+    x = torch.tensor([ids[:-1]], dtype=torch.long)
     y = torch.tensor([ids[1:]],  dtype=torch.long)
-
-    # Дополнительная проверка на всякий случай
-    if x.shape[1] > MAX_LEN:
-        x = x[:, :MAX_LEN]
-        y = y[:, :MAX_LEN]
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=0)
     logits  = model(x)
     loss    = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
 
-    if rating <= BAD_RATING:
-        loss = -0.3 * loss
+    if rating >= GOOD_RATING:
+        # Хорошая шутка — усиливаем
+        pass
+    elif rating <= BAD_RATING:
+        # Плохая шутка — просто пропускаем, не ломаем веса
+        return  # ← просто не учимся на плохом
 
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
-
     torch.save(model.state_dict(), MODEL_FILE)
     
 # ─── Главный класс ИИ ─────────────────────────────────────────────────────────
@@ -588,7 +583,7 @@ class JokeAI:
         self.word_weights = defaultdict(float)
         self.used_jokes   = set()
 
-        self.tokenizer = CharTokenizer.load(TOKENIZER_FILE) if os.path.exists(TOKENIZER_FILE) else CharTokenizer(jokes)
+        self.tokenizer = BPETokenizer.load(TOKENIZER_FILE) if os.path.exists(TOKENIZER_FILE) else BPETokenizer(jokes)
         dataset = JokeDataset(jokes, self.tokenizer)
         self.gpt = TinyJokeGPT(vocab_size=self.tokenizer.vocab_size)
 
@@ -607,10 +602,10 @@ class JokeAI:
         self.load_ratings()
 
     def generate(self):
-        # Просто даём начало без темы — модель сама придумает
-        prompt = "<s>"
+        starters = ["Однажды", "Приходит", "Мужик", "Жена", "Почему", "Штирлиц"]
+        prompt = random.choice(starters)
         joke = generate_joke(self.gpt, self.tokenizer, prompt)
-        return joke if joke else "Не смог придумать шутку, попробуй ещё раз."
+        return joke if len(joke) > 10 else "Не смог придумать шутку, попробуй ещё раз."
 
     def learn_from_rating(self, joke, rating, silent=False):
         words = split_words(joke)
